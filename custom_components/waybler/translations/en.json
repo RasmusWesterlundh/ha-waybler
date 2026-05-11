@@ -1,0 +1,75 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Waybler — Log in",
+        "description": "Enter your Waybler account credentials.",
+        "data": {
+          "email": "Email address",
+          "password": "Password"
+        }
+      },
+      "station": {
+        "title": "Waybler — Charging station",
+        "description": "Enter the IDs for your parking spot and contract. You can find these in the Waybler app or from your setup document.",
+        "data": {
+          "station_id": "Station ID",
+          "contract_user_id": "Contract user ID",
+          "zone_id": "Zone ID",
+          "price_sensor": "Spot price sensor (optional)"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid credentials — check your email and password.",
+      "cannot_connect": "Could not connect to Waybler — check your internet connection."
+    },
+    "abort": {
+      "already_configured": "This Waybler account is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Waybler options",
+        "data": {
+          "price_sensor": "Spot price sensor (optional)",
+          "station_id": "Station ID",
+          "contract_user_id": "Contract user ID",
+          "zone_id": "Zone ID"
+        }
+      }
+    }
+  },
+  "entity": {
+    "switch": {
+      "charging": {
+        "name": "Charging"
+      }
+    },
+    "sensor": {
+      "session_id": {
+        "name": "Session ID"
+      },
+      "session_energy_kwh": {
+        "name": "Session energy"
+      },
+      "session_start_time": {
+        "name": "Session start"
+      },
+      "total_sessions": {
+        "name": "Total sessions"
+      }
+    },
+    "number": {
+      "spot_price_limit": {
+        "name": "Spot price limit"
+      }
+    },
+    "binary_sensor": {
+      "car_connected": {
+        "name": "Car connected"
+      }
+    }
+  }
+}
