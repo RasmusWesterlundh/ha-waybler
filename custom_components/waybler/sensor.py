@@ -58,6 +58,20 @@ SENSOR_DESCRIPTIONS: tuple[WayblerSensorDescription, ...] = (
         icon="mdi:ev-station",
         native_unit_of_measurement=None,
     ),
+    WayblerSensorDescription(
+        key="computed_price_limit",
+        translation_key="computed_price_limit",
+        icon="mdi:currency-eur",
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=None,   # unit set dynamically from currency
+    ),
+    WayblerSensorDescription(
+        key="charge_time_today",
+        translation_key="charge_time_today",
+        icon="mdi:clock-outline",
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement="h",
+    ),
 )
 
 
@@ -114,4 +128,16 @@ class WayblerSensor(CoordinatorEntity[WayblerCoordinator], SensorEntity):
             return round(active.power_w, 1) if active else None
         if key == "station_state":
             return data.station_state
+        if key == "computed_price_limit":
+            return round(data.computed_price_limit, 4) if data.computed_price_limit is not None else None
+        if key == "charge_time_today":
+            return round(data.charge_time_today_h, 3)
         return None
+
+    @property
+    def native_unit_of_measurement(self) -> str | None:
+        """Return the unit — dynamic for computed_price_limit (uses zone currency)."""
+        if self.entity_description.key == "computed_price_limit":
+            data: CoordinatorData | None = self.coordinator.data
+            return data.price_currency if data and data.price_currency else None
+        return self.entity_description.native_unit_of_measurement

@@ -6,7 +6,8 @@ import asyncio
 import base64
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import aiohttp
@@ -24,12 +25,12 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-class WayblerAuthError(Exception):
-    """Raised when authentication fails."""
-
-
 class WayblerApiError(Exception):
     """Raised on non-auth API errors."""
+
+
+class WayblerAuthError(WayblerApiError):
+    """Raised when authentication fails."""
 
 
 class WayblerCarNotConnectedError(WayblerApiError):
@@ -53,12 +54,27 @@ class SessionData:
 
 
 @dataclass
+class PriceEntry:
+    """A single hourly price entry from the Waybler priceList."""
+
+    starts_at: datetime   # timezone-aware, from the "at" field
+    price: float          # consumptionFee.total — inc. VAT, in zone currency
+    currency: str         # e.g. "SEK"
+
+
+@dataclass
 class CoordinatorData:
     """Data held by the coordinator, driven by WebSocket pushes."""
 
     active_session: SessionData | None
-    car_connected: bool | None   # True = station state is "Busy"; None = unknown
-    station_state: str | None    # "Busy", "NoEv", "Available", …
+    car_connected: bool | None   # True when car is physically present; None = unknown
+    station_state: str | None    # "EvConnected", "Busy", "NoEv", …
+    price_schedule: list[PriceEntry] = field(default_factory=list)
+    is_variable_price_zone: bool = False
+    price_currency: str = ""
+    price_vat_rate: float = 0.25   # consumptionVatRate from zone model (e.g. 0.25 = 25%)
+    computed_price_limit: float | None = None
+    charge_time_today_h: float = 0.0
 
 
 def _decode_jwt_user_id(token: str) -> int:

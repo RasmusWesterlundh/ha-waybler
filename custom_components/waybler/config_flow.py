@@ -17,13 +17,26 @@ from .api import WayblerApiClient, WayblerAuthError, WayblerApiError
 from .const import (
     CONF_CONTRACT_USER_ID,
     CONF_EMAIL,
+    CONF_OPT_AUTO_START,
+    CONF_OPT_FIXED_LIMIT,
+    CONF_OPT_MIN_HOURS,
+    CONF_OPT_PERCENTILE,
+    CONF_OPT_STRATEGY,
     CONF_PASSWORD,
     CONF_PRICE_SENSOR,
     CONF_STATION_ID,
     CONF_TOKEN,
     CONF_USER_ID,
     CONF_ZONE_ID,
+    DEFAULT_OPT_AUTO_START,
+    DEFAULT_OPT_MIN_HOURS,
+    DEFAULT_OPT_PERCENTILE,
+    DEFAULT_OPT_STRATEGY,
     DOMAIN,
+    STRATEGIES,
+    STRATEGY_FIXED,
+    STRATEGY_N_CHEAPEST,
+    STRATEGY_PERCENTILE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -139,7 +152,7 @@ class WayblerConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class WayblerOptionsFlow(OptionsFlow):
-    """Handle options (price sensor, IDs) after initial setup."""
+    """Handle options (price sensor, IDs, price optimization) after initial setup."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -148,7 +161,10 @@ class WayblerOptionsFlow(OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(data=user_input)
 
-        current = self.config_entry.data
+        current_data = self.config_entry.data
+        current_opts = self.config_entry.options
+        strategy = current_opts.get(CONF_OPT_STRATEGY, DEFAULT_OPT_STRATEGY)
+
         schema = vol.Schema(
             {
                 vol.Optional(CONF_PRICE_SENSOR): selector.EntitySelector(
@@ -156,16 +172,49 @@ class WayblerOptionsFlow(OptionsFlow):
                 ),
                 vol.Optional(
                     CONF_STATION_ID,
-                    default=current.get(CONF_STATION_ID, _DEFAULT_STATION_ID),
+                    default=current_data.get(CONF_STATION_ID, _DEFAULT_STATION_ID),
                 ): int,
                 vol.Optional(
                     CONF_CONTRACT_USER_ID,
-                    default=current.get(CONF_CONTRACT_USER_ID, _DEFAULT_CONTRACT_USER_ID),
+                    default=current_data.get(CONF_CONTRACT_USER_ID, _DEFAULT_CONTRACT_USER_ID),
                 ): int,
                 vol.Optional(
                     CONF_ZONE_ID,
-                    default=current.get(CONF_ZONE_ID, _DEFAULT_ZONE_ID),
+                    default=current_data.get(CONF_ZONE_ID, _DEFAULT_ZONE_ID),
                 ): int,
+                # Price optimization
+                vol.Optional(
+                    CONF_OPT_AUTO_START,
+                    default=current_opts.get(CONF_OPT_AUTO_START, DEFAULT_OPT_AUTO_START),
+                ): bool,
+                vol.Optional(
+                    CONF_OPT_STRATEGY,
+                    default=strategy,
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=STRATEGIES,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                        translation_key="opt_strategy",
+                    )
+                ),
+                vol.Optional(
+                    CONF_OPT_MIN_HOURS,
+                    default=current_opts.get(CONF_OPT_MIN_HOURS, DEFAULT_OPT_MIN_HOURS),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=1, max=12, step=0.5, mode=selector.NumberSelectorMode.BOX)
+                ),
+                vol.Optional(
+                    CONF_OPT_PERCENTILE,
+                    default=current_opts.get(CONF_OPT_PERCENTILE, DEFAULT_OPT_PERCENTILE),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=10, max=90, step=5, mode=selector.NumberSelectorMode.SLIDER)
+                ),
+                vol.Optional(
+                    CONF_OPT_FIXED_LIMIT,
+                    default=current_opts.get(CONF_OPT_FIXED_LIMIT, 2.0),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0, max=10, step=0.01, mode=selector.NumberSelectorMode.BOX)
+                ),
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)

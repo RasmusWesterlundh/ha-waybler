@@ -36,3 +36,24 @@ JWT_USER_ID_CLAIM = "http://schemas.microsoft.com/ws/2008/06/identity/claims/use
 
 # Platforms
 PLATFORMS = ["binary_sensor", "number", "sensor", "switch"]
+
+# Price optimization strategies
+STRATEGY_N_CHEAPEST = "n_cheapest_hours"
+STRATEGY_BELOW_AVG = "below_average"
+STRATEGY_PERCENTILE = "percentile"
+STRATEGY_FIXED = "fixed"
+
+STRATEGIES = [STRATEGY_N_CHEAPEST, STRATEGY_BELOW_AVG, STRATEGY_PERCENTILE, STRATEGY_FIXED]
+
+# Price optimization option keys (stored in config entry options)
+CONF_OPT_STRATEGY = "opt_strategy"
+CONF_OPT_MIN_HOURS = "opt_min_hours"       # default 4
+CONF_OPT_PERCENTILE = "opt_percentile"     # default 40
+CONF_OPT_FIXED_LIMIT = "opt_fixed_limit"
+CONF_OPT_AUTO_START = "opt_auto_start"     # default True
+
+# Defaults
+DEFAULT_OPT_STRATEGY = STRATEGY_N_CHEAPEST
+DEFAULT_OPT_MIN_HOURS = 4.0
+DEFAULT_OPT_PERCENTILE = 40
+DEFAULT_OPT_AUTO_START = True

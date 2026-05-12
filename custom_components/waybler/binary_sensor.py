@@ -38,11 +38,10 @@ async def async_setup_entry(
 
 
 class WayblerCarConnected(CoordinatorEntity[WayblerCoordinator], BinarySensorEntity):
-    """Binary sensor indicating whether a car is connected to the charger.
+    """Binary sensor indicating whether a car is physically connected to the charger.
 
-    The Waybler API does not expose charger plug state directly.
-    This sensor is True when an active session exists (car must be connected)
-    and None (unknown) otherwise.
+    True when ``station_state`` is ``"EvConnected"`` (car present, no session)
+    or ``"Busy"`` (session in progress).  None when state is unknown.
     """
 
     entity_description = CAR_CONNECTED_DESCRIPTION

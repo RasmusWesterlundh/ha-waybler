@@ -17,6 +17,9 @@
           "contract_user_id": "Contract user ID",
           "zone_id": "Zone ID",
           "price_sensor": "Spot price sensor (optional)"
+        },
+        "data_description": {
+          "price_sensor": "Override the spot price source used by the optimizer. Leave empty to use the price data built into the Waybler integration."
         }
       }
     },
@@ -36,13 +39,39 @@
           "price_sensor": "Spot price sensor (optional)",
           "station_id": "Station ID",
           "contract_user_id": "Contract user ID",
-          "zone_id": "Zone ID"
+          "zone_id": "Zone ID",
+          "opt_auto_start": "Auto-start when car connects",
+          "opt_strategy": "Charging strategy",
+          "opt_min_hours": "Target charge hours",
+          "opt_percentile": "Price percentile",
+          "opt_fixed_limit": "Fixed price ceiling (EUR/kWh)"
+        },
+        "data_description": {
+          "price_sensor": "Override the spot price source used by the optimizer. Leave empty to use the price data built into the Waybler integration.",
+          "opt_auto_start": "When enabled, a charging session starts automatically as soon as the car is plugged in, using the selected strategy to set the price limit.",
+          "opt_strategy": "How the optimizer calculates the maximum price it will accept to charge. See each option for details.",
+          "opt_min_hours": "Used by the 'Cheapest hours' strategy. The optimizer will pick enough of the cheapest upcoming hours to cover this many hours of charging.",
+          "opt_percentile": "Used by the 'Percentile' strategy. For example, 40 means the optimizer will only charge when the current price is in the cheapest 40% of today's prices.",
+          "opt_fixed_limit": "Used by the 'Fixed ceiling' strategy. Charging is allowed as long as the spot price stays below this value (EUR/kWh, excl. VAT)."
         }
+      }
+    }
+  },
+  "selector": {
+    "opt_strategy": {
+      "options": {
+        "n_cheapest_hours": "Cheapest hours",
+        "below_average": "Below average",
+        "percentile": "Percentile",
+        "fixed": "Fixed ceiling"
       }
     }
   },
   "entity": {
     "switch": {
+      "price_optimization": {
+        "name": "Price optimization"
+      },
       "charging": {
         "name": "Charging"
       }
@@ -54,16 +83,22 @@
       "session_energy_kwh": {
         "name": "Session energy"
       },
-      "session_start_time": {
-        "name": "Session start"
+      "session_power_w": {
+        "name": "Session power"
       },
-      "total_sessions": {
-        "name": "Total sessions"
+      "station_state": {
+        "name": "Station state"
+      },
+      "computed_price_limit": {
+        "name": "Computed price limit"
+      },
+      "charge_time_today": {
+        "name": "Charge time today"
       }
     },
     "number": {
       "spot_price_limit": {
-        "name": "Spot price limit"
+        "name": "Manual price limit"
       }
     },
     "binary_sensor": {

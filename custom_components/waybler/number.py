@@ -30,6 +30,7 @@ PRICE_LIMIT_DESCRIPTION = NumberEntityDescription(
     native_max_value=10.0,
     native_step=0.01,
     mode=NumberMode.BOX,
+    entity_registry_enabled_default=False,
 )
 
 
@@ -38,7 +39,7 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Waybler number entity."""
+    """Set up Waybler number entities."""
     coordinator: WayblerCoordinator = entry.runtime_data
     async_add_entities([WayblerSpotPriceLimit(coordinator, entry)])
 
