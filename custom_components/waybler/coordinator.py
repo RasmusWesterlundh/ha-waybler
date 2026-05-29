@@ -122,6 +122,11 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
         # Runtime flag — cleared when user manually stops charging, reset on new car connection
         self._optimization_enabled: bool = True
 
+        # Tracks whether a session model arrived during the current WS init sequence.
+        # Used to detect stale _last_session_msg after a reconnect where the session
+        # had already ended on the Waybler backend (no Finished message was delivered).
+        self._session_seen_in_ws_init: bool = False
+
         # Pre-populate data so entities start in "unknown" rather than "unavailable"
         self.data = _EMPTY_DATA
 
@@ -278,6 +283,8 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
     async def _ws_connect(self) -> None:
         """Open one WebSocket connection and read messages until it closes."""
+        # Reset per-connection init tracking so stale-session detection works correctly
+        self._session_seen_in_ws_init = False
         ws_url = f"{WS_URL}?jwt={self._token}&app-uuid={WS_APP_UUID}"
         _LOGGER.info("Waybler WS connecting to %s", WS_URL)
         try:
@@ -328,8 +335,20 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if model_type == "WebsocketInitMessage":
             # This arrives LAST as an end-of-init marker with no payload.
             # Individual zone/session models are sent as separate messages before it.
-            # Do NOT reset state here — just log and ignore.
             _LOGGER.info("Waybler WS init complete (WebsocketInitMessage received)")
+            # Bug fix: if no session model arrived during init but we still have
+            # _last_session_msg in memory, that data is stale (the session ended on
+            # the Waybler backend while we were disconnected / HA was restarting).
+            if not self._session_seen_in_ws_init and self._last_session_msg is not None:
+                _LOGGER.info(
+                    "Waybler WS init: no session received — clearing stale session (id=%s)",
+                    self._active_session_id,
+                )
+                self._last_session_msg = None
+                self._active_session_id = None
+                self._push_coordinator_update()
+                if self._station_state == "EvConnected" and self._optimization_enabled:
+                    self.hass.async_create_task(self._async_run_price_optimization())
         elif model_type == "ChargeZoneModel":
             self._apply_zone_model(msg)
         elif model_type == "ChargeSessionModel":
@@ -353,12 +372,26 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 if (
                     self._station_state == "EvConnected"
                     and prev_state != "EvConnected"
-                    and self._is_variable_price_zone
                     and (self.data is None or self.data.active_session is None)
                 ):
                     self.hass.async_create_task(
                         self._async_run_price_optimization()
                     )
+                # Bug fix: Waybler keeps a Waiting session alive across car disconnects.
+                # When the car reconnects, the station goes Available → Busy (skipping
+                # EvConnected entirely), so the normal optimization trigger never fires.
+                # Refresh the price limit so the session reflects current market prices.
+                elif (
+                    self._station_state == "Busy"
+                    and prev_state not in ("Busy", "EvConnected")
+                    and self._last_session_msg
+                    and self._last_session_msg.get("status") == "Waiting"
+                ):
+                    _LOGGER.info(
+                        "Waybler WS StationUpdatedEvent: car reconnected to Waiting session"
+                        " — refreshing price limit"
+                    )
+                    self.hass.async_create_task(self._async_update_waiting_session_limit())
         else:
             _LOGGER.debug("Waybler WS unknown modelType=%r", model_type)
 
@@ -415,13 +448,22 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if (
             self._station_state == "EvConnected"
             and prev_state != "EvConnected"
-            and self._is_variable_price_zone
             and (self.data is None or self.data.active_session is None)
         ):
             self._optimization_enabled = True  # reset on new car connection
             self.hass.async_create_task(
                 self._async_run_price_optimization()
             )
+
+        # Bug fix: when fresh price data arrives (zone model on WS reconnect), refresh
+        # the price limit for any Waiting session so it reflects current market prices.
+        # This covers HA restarts and WS reconnects where car stays plugged in.
+        if (
+            self._last_session_msg
+            and self._last_session_msg.get("status") == "Waiting"
+            and self._price_schedule
+        ):
+            self.hass.async_create_task(self._async_update_waiting_session_limit())
 
     def _apply_session_model(self, session: dict | None) -> None:
         """Cache the latest session message and push a coordinator update."""
@@ -430,6 +472,12 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
             self._accumulate_charge_time()
             self._last_session_msg = None
             self._active_session_id = None
+            self._push_coordinator_update()
+            # Re-trigger optimization if car is still connected and session ended naturally
+            if self._station_state == "EvConnected" and self._optimization_enabled:
+                _LOGGER.debug("Waybler: session cleared, car still connected — re-triggering optimization")
+                self.hass.async_create_task(self._async_run_price_optimization())
+            return
         elif session.get("status") in _INACTIVE_STATUSES:
             _LOGGER.info(
                 "Waybler session ended: status=%r sessionId=%s",
@@ -438,6 +486,15 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
             self._accumulate_charge_time()
             self._last_session_msg = None
             self._active_session_id = None
+            self._push_coordinator_update()
+            # Re-trigger optimization if car is still connected and session ended naturally
+            if self._station_state == "EvConnected" and self._optimization_enabled:
+                _LOGGER.debug(
+                    "Waybler: session finished (status=%r), car still connected — re-triggering optimization",
+                    session.get("status"),
+                )
+                self.hass.async_create_task(self._async_run_price_optimization())
+            return
         else:
             _LOGGER.debug(
                 "Waybler WS session model: ACTIVE status=%r sessionId=%s power=%s energy=%s",
@@ -455,7 +512,9 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
             self._last_session_msg = session
             self._active_session_id = session.get("sessionId")
-        self._push_coordinator_update()
+            # Mark that a session was received during this WS init sequence
+            self._session_seen_in_ws_init = True
+        self._push_coordinator_update()  # reached only for active session updates
 
     def _accumulate_charge_time(self) -> None:
         """Add any in-progress Charging interval to the daily accumulator."""
@@ -686,6 +745,73 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 _LOGGER.error("Waybler: could not start price-optimized session: %s", err)
         finally:
             self._optimization_running = False
+
+    async def _async_update_waiting_session_limit(self) -> None:
+        """Recompute and push a fresh price limit to an active Waiting session.
+
+        Called when new price data arrives (zone model on WS reconnect) or when
+        the car reconnects directly to an existing Waiting session (Available → Busy).
+        This ensures the session's price ceiling always reflects current market prices
+        rather than a stale limit computed at the original session-start time.
+        """
+        if self._optimization_running:
+            return
+        if not (self._last_session_msg and self._last_session_msg.get("status") == "Waiting"):
+            _LOGGER.debug("Waybler: _async_update_waiting_session_limit: no Waiting session — skipped")
+            return
+        if self._active_session_id is None:
+            return
+
+        opts = self._entry.options
+        strategy: str = opts.get(CONF_OPT_STRATEGY, DEFAULT_OPT_STRATEGY)
+        min_hours: float = opts.get(CONF_OPT_MIN_HOURS, DEFAULT_OPT_MIN_HOURS)
+        pct: int = int(opts.get(CONF_OPT_PERCENTILE, DEFAULT_OPT_PERCENTILE))
+        fixed_limit: float | None = opts.get(CONF_OPT_FIXED_LIMIT)
+
+        now = dt_util.now()
+        upcoming = filter_upcoming(self._price_schedule, now)
+        if not upcoming and strategy != "fixed":
+            _LOGGER.debug("Waybler: can't refresh Waiting session limit — no upcoming prices")
+            return
+
+        remaining = max(0.0, min_hours - self.charge_time_today_h)
+        limit = compute_price_limit(
+            prices=upcoming,
+            strategy=strategy,
+            remaining_hours=remaining,
+            min_hours=min_hours,
+            percentile_value=pct,
+            fixed_limit=fixed_limit,
+        )
+
+        if limit is None:
+            _LOGGER.debug("Waybler: Waiting session limit update: computed None — skipping")
+            return
+
+        if limit == self._computed_price_limit:
+            _LOGGER.debug(
+                "Waybler: Waiting session %s limit unchanged (%.4f) — no update",
+                self._active_session_id, limit,
+            )
+            return
+
+        _LOGGER.info(
+            "Waybler: refreshing Waiting session %s price limit %s → %.4f (strategy=%s)",
+            self._active_session_id,
+            f"{self._computed_price_limit:.4f}" if self._computed_price_limit else "None",
+            limit,
+            strategy,
+        )
+        self._computed_price_limit = limit
+        api_limit = round(limit / (1.0 + self._price_vat_rate), 4)
+        try:
+            await self.async_update_price_limit(api_limit)
+            self._push_coordinator_update()
+        except WayblerApiError as err:
+            _LOGGER.warning(
+                "Waybler: could not refresh Waiting session %s price limit: %s",
+                self._active_session_id, err,
+            )
 
     def _get_manual_price_limit(self) -> float | None:
         """Return the manual price limit (incl. VAT) if set, enabled and non-zero, else None."""

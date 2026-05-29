@@ -25,7 +25,7 @@ A custom Home Assistant integration for [Waybler](https://waybler.com/) EV charg
 | `sensor.waybler_ev_charger_computed_price_limit` | Sensor | Price limit the optimizer last calculated (incl. VAT) |
 | `sensor.waybler_ev_charger_charge_time_today` | Sensor | Total charge time today (hours) |
 | `binary_sensor.waybler_ev_charger_car_connected` | Binary sensor | True when a car is plugged in |
-| `number.waybler_ev_charger_spot_price_limit` | Number | Manual price limit override (disabled by default) |
+| `number.waybler_ev_charger_spot_price_limit` | Number | Manual price limit override in SEK/kWh (disabled by default) |
 
 ## Installation via HACS
 
@@ -72,7 +72,7 @@ When the car connects, the optimizer automatically computes a price limit and st
 | Charging strategy | How the price limit is calculated (see below) |
 | Target charge hours | *Cheapest hours*: how many hours of charging to cover |
 | Price percentile | *Percentile*: only charge when price is in the cheapest N% |
-| Fixed price ceiling | *Fixed ceiling*: maximum price to accept (EUR/kWh, excl. VAT) |
+| Fixed price ceiling | *Fixed ceiling*: maximum price to accept (SEK/kWh, excl. VAT) |
 
 ### Strategies
 
@@ -83,7 +83,7 @@ When the car connects, the optimizer automatically computes a price limit and st
 
 ### Manual override
 
-Enable the `Manual price limit` number entity (disabled by default) and set a value (incl. VAT, SEK/kWh). When set to any value above 0, the optimizer is bypassed and this limit is used directly.
+Enable the `Manual price limit` number entity (disabled by default) and set a value in SEK/kWh (incl. VAT). When set to any value above 0, the optimizer is bypassed and this limit is used directly.
 
 ## How it works
 

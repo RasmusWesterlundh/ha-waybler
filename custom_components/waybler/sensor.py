@@ -61,7 +61,7 @@ SENSOR_DESCRIPTIONS: tuple[WayblerSensorDescription, ...] = (
     WayblerSensorDescription(
         key="computed_price_limit",
         translation_key="computed_price_limit",
-        icon="mdi:currency-eur",
+        icon="mdi:currency-sign",
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=None,   # unit set dynamically from currency
     ),

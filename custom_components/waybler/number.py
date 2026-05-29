@@ -25,7 +25,7 @@ _LOGGER = logging.getLogger(__name__)
 PRICE_LIMIT_DESCRIPTION = NumberEntityDescription(
     key="spot_price_limit",
     translation_key="spot_price_limit",
-    icon="mdi:currency-eur",
+    icon="mdi:currency-sign",
     native_min_value=0.0,
     native_max_value=10.0,
     native_step=0.01,
@@ -47,7 +47,7 @@ async def async_setup_entry(
 class WayblerSpotPriceLimit(
     CoordinatorEntity[WayblerCoordinator], NumberEntity, RestoreEntity
 ):
-    """Number entity for configuring the spot price charging limit (EUR/kWh).
+    """Number entity for configuring the spot price charging limit (SEK/kWh).
 
     When set, Waybler will automatically pause charging when the spot price
     exceeds this value. The value is pushed to the active session when changed,
