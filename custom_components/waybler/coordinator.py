@@ -53,6 +53,11 @@ _LOGGER = logging.getLogger(__name__)
 # Statuses that mean the session is not charging
 _INACTIVE_STATUSES = {"Stopped", "Finished", "Error"}
 
+# Maximum number of hours ahead to consider when computing a price limit.
+# Prevents "infinite deferral" where tomorrow's much-cheaper prices push the
+# computed ceiling so low that today never charges.
+_OPT_MAX_WINDOW_HOURS = 24
+
 _EMPTY_DATA = CoordinatorData(
     active_session=None,
     car_connected=None,
@@ -374,6 +379,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     and prev_state != "EvConnected"
                     and (self.data is None or self.data.active_session is None)
                 ):
+                    self._optimization_enabled = True  # reset on new car connection
                     self.hass.async_create_task(
                         self._async_run_price_optimization()
                     )
@@ -686,6 +692,8 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
             now = dt_util.now()
             upcoming = filter_upcoming(self._price_schedule, now)
+            window_end = now + timedelta(hours=_OPT_MAX_WINDOW_HOURS)
+            upcoming = [p for p in upcoming if p.starts_at <= window_end]
             if not upcoming and strategy != "fixed":
                 _LOGGER.warning(
                     "Waybler price optimization: no upcoming price entries — cannot compute limit"
@@ -770,6 +778,8 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         now = dt_util.now()
         upcoming = filter_upcoming(self._price_schedule, now)
+        window_end = now + timedelta(hours=_OPT_MAX_WINDOW_HOURS)
+        upcoming = [p for p in upcoming if p.starts_at <= window_end]
         if not upcoming and strategy != "fixed":
             _LOGGER.debug("Waybler: can't refresh Waiting session limit — no upcoming prices")
             return
