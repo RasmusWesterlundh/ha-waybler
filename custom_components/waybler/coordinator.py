@@ -13,7 +13,7 @@ import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
-from homeassistant.helpers.event import async_track_point_in_time
+from homeassistant.helpers.event import async_track_point_in_time, async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
@@ -57,6 +57,15 @@ _INACTIVE_STATUSES = {"Stopped", "Finished", "Error"}
 # Prevents "infinite deferral" where tomorrow's much-cheaper prices push the
 # computed ceiling so low that today never charges.
 _OPT_MAX_WINDOW_HOURS = 24
+
+# Periodic backstop in case a transient WS ordering issue misses a trigger.
+_SAFETY_RECONCILE_INTERVAL_MIN = 5
+
+# Guardrail: require at least one eligible hour in the near-term horizon.
+# If a strategy computes an overly strict limit, lift it to the cheapest price
+# in the next few hours to avoid deferring charging indefinitely.
+_GUARDRAIL_SOON_WINDOW_HOURS = 6
+_GUARDRAIL_MIN_ELIGIBLE_HOURS = 1
 
 _EMPTY_DATA = CoordinatorData(
     active_session=None,
@@ -120,6 +129,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._charging_start: datetime | None = None
         self._charge_seconds_today: float = 0.0
         self._midnight_unsub: Callable | None = None
+        self._safety_reconcile_unsub: Callable | None = None
 
         # Guard: prevent concurrent optimization tasks
         self._optimization_running: bool = False
@@ -231,6 +241,30 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
             self.hass, _handle_midnight_reset, midnight
         )
 
+    def _schedule_safety_reconcile(self) -> None:
+        """Run a low-frequency reconcile pass as a safety backstop."""
+        if self._safety_reconcile_unsub is not None:
+            self._safety_reconcile_unsub()
+            self._safety_reconcile_unsub = None
+
+        @callback
+        def _handle_safety_tick(now_: datetime) -> None:  # noqa: ARG001
+            self.hass.async_create_task(self._async_safety_reconcile())
+
+        self._safety_reconcile_unsub = async_track_time_interval(
+            self.hass,
+            _handle_safety_tick,
+            timedelta(minutes=_SAFETY_RECONCILE_INTERVAL_MIN),
+        )
+
+    async def _async_safety_reconcile(self) -> None:
+        """Periodic no-op-safe reconcile to recover from missed WS trigger paths."""
+        if self._station_state not in ("EvConnected", "Busy"):
+            return
+        if self._optimization_running:
+            return
+        self._reconcile_ws_state()
+
     # ------------------------------------------------------------------
     # DataUpdateCoordinator — called once on startup (no polling)
     # ------------------------------------------------------------------
@@ -248,6 +282,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if self._ws_task and not self._ws_task.done():
             return
         self._schedule_midnight_reset()
+        self._schedule_safety_reconcile()
         self._ws_task = self.hass.async_create_background_task(
             self._ws_run(), "waybler_websocket"
         )
@@ -260,6 +295,9 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if self._midnight_unsub is not None:
             self._midnight_unsub()
             self._midnight_unsub = None
+        if self._safety_reconcile_unsub is not None:
+            self._safety_reconcile_unsub()
+            self._safety_reconcile_unsub = None
 
     async def _ws_run(self) -> None:
         """WebSocket listener loop — reconnects on any failure."""
@@ -572,10 +610,60 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
             and self._last_session_msg.get("status") == "Waiting"
             and self._active_session_id is not None
         ):
-            _LOGGER.info(
+            _LOGGER.debug(
                 "Waybler WS reconcile: Busy station with Waiting session — refreshing price limit"
             )
             self.hass.async_create_task(self._async_update_waiting_session_limit())
+
+    def _compute_guarded_limit(
+        self,
+        *,
+        strategy: str,
+        remaining: float,
+        min_hours: float,
+        percentile_value: int,
+        fixed_limit: float | None,
+    ) -> tuple[float | None, list[PriceEntry]]:
+        """Compute strategy limit plus near-term anti-deferral guardrails."""
+        now = dt_util.now()
+        upcoming = filter_upcoming(self._price_schedule, now)
+        window_end = now + timedelta(hours=_OPT_MAX_WINDOW_HOURS)
+        upcoming = [p for p in upcoming if p.starts_at <= window_end]
+
+        if not upcoming and strategy != "fixed":
+            return None, []
+
+        limit = compute_price_limit(
+            prices=upcoming,
+            strategy=strategy,
+            remaining_hours=remaining,
+            min_hours=min_hours,
+            percentile_value=percentile_value,
+            fixed_limit=fixed_limit,
+        )
+
+        if (
+            limit is not None
+            and strategy != "fixed"
+            and remaining > 0
+        ):
+            soon_end = now + timedelta(hours=_GUARDRAIL_SOON_WINDOW_HOURS)
+            soon_prices = [p for p in upcoming if p.starts_at <= soon_end]
+            if soon_prices:
+                eligible_soon = sum(1 for p in soon_prices if p.price <= limit)
+                if eligible_soon < _GUARDRAIL_MIN_ELIGIBLE_HOURS:
+                    fallback_limit = min(p.price for p in soon_prices)
+                    if fallback_limit > limit:
+                        _LOGGER.warning(
+                            "Waybler guardrail: computed limit %.4f yields no eligible hours in next %dh; "
+                            "lifting to %.4f",
+                            limit,
+                            _GUARDRAIL_SOON_WINDOW_HOURS,
+                            fallback_limit,
+                        )
+                        limit = fallback_limit
+
+        return limit, upcoming
 
     # ------------------------------------------------------------------
     # Session control — called by switch / number entities
@@ -695,25 +783,20 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
             pct: int = int(opts.get(CONF_OPT_PERCENTILE, DEFAULT_OPT_PERCENTILE))
             fixed_limit: float | None = opts.get(CONF_OPT_FIXED_LIMIT)
 
-            now = dt_util.now()
-            upcoming = filter_upcoming(self._price_schedule, now)
-            window_end = now + timedelta(hours=_OPT_MAX_WINDOW_HOURS)
-            upcoming = [p for p in upcoming if p.starts_at <= window_end]
+            remaining = max(0.0, min_hours - self.charge_time_today_h)
+            limit, upcoming = self._compute_guarded_limit(
+                strategy=strategy,
+                remaining=remaining,
+                min_hours=min_hours,
+                percentile_value=pct,
+                fixed_limit=fixed_limit,
+            )
+
             if not upcoming and strategy != "fixed":
                 _LOGGER.warning(
                     "Waybler price optimization: no upcoming price entries — cannot compute limit"
                 )
                 return
-
-            remaining = max(0.0, min_hours - self.charge_time_today_h)
-            limit = compute_price_limit(
-                prices=upcoming,
-                strategy=strategy,
-                remaining_hours=remaining,
-                min_hours=min_hours,
-                percentile_value=pct,
-                fixed_limit=fixed_limit,
-            )
 
             _LOGGER.info(
                 "Waybler price optimization: strategy=%s remaining=%.1fh limit=%s currency=%s",
@@ -781,23 +864,18 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
         pct: int = int(opts.get(CONF_OPT_PERCENTILE, DEFAULT_OPT_PERCENTILE))
         fixed_limit: float | None = opts.get(CONF_OPT_FIXED_LIMIT)
 
-        now = dt_util.now()
-        upcoming = filter_upcoming(self._price_schedule, now)
-        window_end = now + timedelta(hours=_OPT_MAX_WINDOW_HOURS)
-        upcoming = [p for p in upcoming if p.starts_at <= window_end]
-        if not upcoming and strategy != "fixed":
-            _LOGGER.debug("Waybler: can't refresh Waiting session limit — no upcoming prices")
-            return
-
         remaining = max(0.0, min_hours - self.charge_time_today_h)
-        limit = compute_price_limit(
-            prices=upcoming,
+        limit, upcoming = self._compute_guarded_limit(
             strategy=strategy,
-            remaining_hours=remaining,
+            remaining=remaining,
             min_hours=min_hours,
             percentile_value=pct,
             fixed_limit=fixed_limit,
         )
+
+        if not upcoming and strategy != "fixed":
+            _LOGGER.debug("Waybler: can't refresh Waiting session limit — no upcoming prices")
+            return
 
         if limit is None:
             _LOGGER.debug("Waybler: Waiting session limit update: computed None — skipping")
