@@ -352,8 +352,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 self._last_session_msg = None
                 self._active_session_id = None
                 self._push_coordinator_update()
-                if self._station_state == "EvConnected" and self._optimization_enabled:
-                    self.hass.async_create_task(self._async_run_price_optimization())
+                self._reconcile_ws_state()
         elif model_type == "ChargeZoneModel":
             self._apply_zone_model(msg)
         elif model_type == "ChargeSessionModel":
@@ -380,9 +379,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     and (self.data is None or self.data.active_session is None)
                 ):
                     self._optimization_enabled = True  # reset on new car connection
-                    self.hass.async_create_task(
-                        self._async_run_price_optimization()
-                    )
+                    self._reconcile_ws_state()
                 # Bug fix: Waybler keeps a Waiting session alive across car disconnects.
                 # When the car reconnects, the station goes Available → Busy (skipping
                 # EvConnected entirely), so the normal optimization trigger never fires.
@@ -397,7 +394,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
                         "Waybler WS StationUpdatedEvent: car reconnected to Waiting session"
                         " — refreshing price limit"
                     )
-                    self.hass.async_create_task(self._async_update_waiting_session_limit())
+                    self._reconcile_ws_state()
         else:
             _LOGGER.debug("Waybler WS unknown modelType=%r", model_type)
 
@@ -457,9 +454,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
             and (self.data is None or self.data.active_session is None)
         ):
             self._optimization_enabled = True  # reset on new car connection
-            self.hass.async_create_task(
-                self._async_run_price_optimization()
-            )
+            self._reconcile_ws_state()
 
         # Bug fix: when fresh price data arrives (zone model on WS reconnect), refresh
         # the price limit for any Waiting session so it reflects current market prices.
@@ -469,7 +464,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
             and self._last_session_msg.get("status") == "Waiting"
             and self._price_schedule
         ):
-            self.hass.async_create_task(self._async_update_waiting_session_limit())
+            self._reconcile_ws_state()
 
     def _apply_session_model(self, session: dict | None) -> None:
         """Cache the latest session message and push a coordinator update."""
@@ -479,10 +474,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
             self._last_session_msg = None
             self._active_session_id = None
             self._push_coordinator_update()
-            # Re-trigger optimization if car is still connected and session ended naturally
-            if self._station_state == "EvConnected" and self._optimization_enabled:
-                _LOGGER.debug("Waybler: session cleared, car still connected — re-triggering optimization")
-                self.hass.async_create_task(self._async_run_price_optimization())
+            self._reconcile_ws_state()
             return
         elif session.get("status") in _INACTIVE_STATUSES:
             _LOGGER.info(
@@ -493,13 +485,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
             self._last_session_msg = None
             self._active_session_id = None
             self._push_coordinator_update()
-            # Re-trigger optimization if car is still connected and session ended naturally
-            if self._station_state == "EvConnected" and self._optimization_enabled:
-                _LOGGER.debug(
-                    "Waybler: session finished (status=%r), car still connected — re-triggering optimization",
-                    session.get("status"),
-                )
-                self.hass.async_create_task(self._async_run_price_optimization())
+            self._reconcile_ws_state()
             return
         else:
             _LOGGER.debug(
@@ -571,6 +557,25 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 charge_time_today_h=self.charge_time_today_h,
             )
         )
+
+    def _reconcile_ws_state(self) -> None:
+        """Re-evaluate charging actions from the current WS snapshot."""
+        if self._station_state == "EvConnected":
+            if self._optimization_enabled and (self.data is None or self.data.active_session is None):
+                self._optimization_enabled = True  # reset on new car connection
+                self.hass.async_create_task(self._async_run_price_optimization())
+            return
+
+        if (
+            self._station_state == "Busy"
+            and self._last_session_msg
+            and self._last_session_msg.get("status") == "Waiting"
+            and self._active_session_id is not None
+        ):
+            _LOGGER.info(
+                "Waybler WS reconcile: Busy station with Waiting session — refreshing price limit"
+            )
+            self.hass.async_create_task(self._async_update_waiting_session_limit())
 
     # ------------------------------------------------------------------
     # Session control — called by switch / number entities
