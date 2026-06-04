@@ -611,6 +611,21 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
     def _reconcile_ws_state(self) -> None:
         """Re-evaluate charging actions from the current WS snapshot."""
         if self._station_state in _PLUGGED_NO_SESSION_STATES:
+            # Backend says the car is plugged but there is no active session.
+            # If we still cache an active session, it is stale and blocks auto-start.
+            if self.data is not None and self.data.active_session is not None:
+                stale = self.data.active_session
+                _LOGGER.warning(
+                    "Waybler WS reconcile: station=%s with stale cached session id=%s status=%s — clearing",
+                    self._station_state,
+                    stale.session_id,
+                    stale.status,
+                )
+                self._accumulate_charge_time()
+                self._last_session_msg = None
+                self._active_session_id = None
+                self._push_coordinator_update()
+
             if self._optimization_enabled and (self.data is None or self.data.active_session is None):
                 self._optimization_enabled = True  # reset on new car connection
                 self.hass.async_create_task(self._async_run_price_optimization())
