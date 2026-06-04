@@ -67,6 +67,12 @@ _SAFETY_RECONCILE_INTERVAL_MIN = 5
 _GUARDRAIL_SOON_WINDOW_HOURS = 6
 _GUARDRAIL_MIN_ELIGIBLE_HOURS = 1
 
+# Station states observed when the car cable is physically connected.
+_PLUGGED_STATES = {"Busy", "EvConnected", "CableConnected"}
+
+# Connected states that indicate "car plugged, no active charging session".
+_PLUGGED_NO_SESSION_STATES = {"EvConnected", "CableConnected"}
+
 _EMPTY_DATA = CoordinatorData(
     active_session=None,
     car_connected=None,
@@ -259,11 +265,19 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
     async def _async_safety_reconcile(self) -> None:
         """Periodic no-op-safe reconcile to recover from missed WS trigger paths."""
-        if self._station_state not in ("EvConnected", "Busy"):
+        if self._station_state not in _PLUGGED_STATES:
             return
         if self._optimization_running:
             return
         self._reconcile_ws_state()
+
+    @staticmethod
+    def _entered_plugged_no_session_state(prev_state: str | None, new_state: str | None) -> bool:
+        """Return True when station just transitioned into a plugged-no-session state."""
+        return (
+            new_state in _PLUGGED_NO_SESSION_STATES
+            and prev_state not in _PLUGGED_NO_SESSION_STATES
+        )
 
     # ------------------------------------------------------------------
     # DataUpdateCoordinator — called once on startup (no polling)
@@ -412,8 +426,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 self._push_coordinator_update()
                 # Trigger price-optimised auto-start when car just plugged in
                 if (
-                    self._station_state == "EvConnected"
-                    and prev_state != "EvConnected"
+                    self._entered_plugged_no_session_state(prev_state, self._station_state)
                     and (self.data is None or self.data.active_session is None)
                 ):
                     self._optimization_enabled = True  # reset on new car connection
@@ -487,8 +500,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         # Trigger price-optimised auto-start if car just became plugged in via zone model
         if (
-            self._station_state == "EvConnected"
-            and prev_state != "EvConnected"
+            self._entered_plugged_no_session_state(prev_state, self._station_state)
             and (self.data is None or self.data.active_session is None)
         ):
             self._optimization_enabled = True  # reset on new car connection
@@ -569,10 +581,10 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 spot_price_limit=session.get("spotPriceLimit"),
             )
 
-        # "EvConnected" = car plugged, no session yet; "Busy" = session active
+        # Plugged states from Waybler include EvConnected/CableConnected/Busy.
         car_connected: bool | None = None
         if self._station_state is not None:
-            car_connected = self._station_state in ("Busy", "EvConnected")
+            car_connected = self._station_state in _PLUGGED_STATES
 
         _LOGGER.debug(
             "Waybler coordinator update: active=%s station_state=%r car_connected=%s listeners=%d",
@@ -598,7 +610,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
     def _reconcile_ws_state(self) -> None:
         """Re-evaluate charging actions from the current WS snapshot."""
-        if self._station_state == "EvConnected":
+        if self._station_state in _PLUGGED_NO_SESSION_STATES:
             if self._optimization_enabled and (self.data is None or self.data.active_session is None):
                 self._optimization_enabled = True  # reset on new car connection
                 self.hass.async_create_task(self._async_run_price_optimization())
