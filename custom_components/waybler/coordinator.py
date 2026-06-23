@@ -61,6 +61,10 @@ _OPT_MAX_WINDOW_HOURS = 24
 # Periodic backstop in case a transient WS ordering issue misses a trigger.
 _SAFETY_RECONCILE_INTERVAL_MIN = 5
 
+# Hard reliability fallback: every 15 minutes, re-auth and force a fresh
+# websocket init sequence to resync station/session state.
+_PERIODIC_REAUTH_RESYNC_INTERVAL_MIN = 15
+
 # Guardrail: require at least one eligible hour in the near-term horizon.
 # If a strategy computes an overly strict limit, lift it to the cheapest price
 # in the next few hours to avoid deferring charging indefinitely.
@@ -136,6 +140,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._charge_seconds_today: float = 0.0
         self._midnight_unsub: Callable | None = None
         self._safety_reconcile_unsub: Callable | None = None
+        self._periodic_reauth_unsub: Callable | None = None
 
         # Guard: prevent concurrent optimization tasks
         self._optimization_running: bool = False
@@ -263,6 +268,22 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
             timedelta(minutes=_SAFETY_RECONCILE_INTERVAL_MIN),
         )
 
+    def _schedule_periodic_reauth_and_resync(self) -> None:
+        """Schedule a fixed timer to re-auth and force WS state resync."""
+        if self._periodic_reauth_unsub is not None:
+            self._periodic_reauth_unsub()
+            self._periodic_reauth_unsub = None
+
+        @callback
+        def _handle_periodic_reauth_tick(now_: datetime) -> None:  # noqa: ARG001
+            self.hass.async_create_task(self._async_periodic_reauth_and_resync())
+
+        self._periodic_reauth_unsub = async_track_time_interval(
+            self.hass,
+            _handle_periodic_reauth_tick,
+            timedelta(minutes=_PERIODIC_REAUTH_RESYNC_INTERVAL_MIN),
+        )
+
     async def _async_safety_reconcile(self) -> None:
         """Periodic no-op-safe reconcile to recover from missed WS trigger paths."""
         if self._station_state not in _PLUGGED_STATES:
@@ -270,6 +291,36 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if self._optimization_running:
             return
         self._reconcile_ws_state()
+
+    async def _async_periodic_reauth_and_resync(self) -> None:
+        """Re-authenticate and force a fresh WS init snapshot every fixed interval."""
+        _LOGGER.info("Waybler periodic re-auth/resync tick: starting")
+
+        try:
+            await self.async_refresh_and_save_token()
+        except ConfigEntryAuthFailed as err:
+            _LOGGER.error("Waybler periodic re-auth/resync: auth failed: %s", err)
+            return
+
+        await self._async_restart_websocket_connection()
+        self._reconcile_ws_state()
+
+    async def _async_restart_websocket_connection(self) -> None:
+        """Restart the WS listener task to force a fresh init/state sync."""
+        old_task = self._ws_task
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+            try:
+                await old_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as err:  # pragma: no cover - defensive logging
+                _LOGGER.debug("Waybler periodic WS restart: previous task ended with %s", err)
+
+        self._ws_task = self.hass.async_create_background_task(
+            self._ws_run(), "waybler_websocket"
+        )
+        _LOGGER.info("Waybler periodic re-auth/resync: websocket restarted")
 
     @staticmethod
     def _entered_plugged_no_session_state(prev_state: str | None, new_state: str | None) -> bool:
@@ -297,6 +348,7 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
             return
         self._schedule_midnight_reset()
         self._schedule_safety_reconcile()
+        self._schedule_periodic_reauth_and_resync()
         self._ws_task = self.hass.async_create_background_task(
             self._ws_run(), "waybler_websocket"
         )
@@ -312,6 +364,9 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if self._safety_reconcile_unsub is not None:
             self._safety_reconcile_unsub()
             self._safety_reconcile_unsub = None
+        if self._periodic_reauth_unsub is not None:
+            self._periodic_reauth_unsub()
+            self._periodic_reauth_unsub = None
 
     async def _ws_run(self) -> None:
         """WebSocket listener loop — reconnects on any failure."""
