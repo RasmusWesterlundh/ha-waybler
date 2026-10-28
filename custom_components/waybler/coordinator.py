@@ -523,6 +523,15 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
             "Waybler WS zone: looking for stationId=%s, found ids=%s, matched state=%r",
             self._station_id, found_ids, station_state,
         )
+        if station_state is None:
+            _LOGGER.warning(
+                "Waybler: configured station %s was not found in zone %s "
+                "(station IDs in this zone: %s). Use Reconfigure to select the "
+                "correct station.",
+                self._station_id,
+                zone.get("zoneId"),
+                found_ids,
+            )
         prev_state = self._station_state
         self._station_state = station_state
 
