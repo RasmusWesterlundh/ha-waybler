@@ -15,6 +15,7 @@ WS_APP_UUID = "8d0a2cfa-4373-43e2-951a-8bff7c25d4d7"
 
 # Request timeout (seconds)
 REQUEST_TIMEOUT = 15
+DISCOVERY_TIMEOUT = 20
 
 # Coordinator poll interval (seconds)
 DEFAULT_SCAN_INTERVAL = 30

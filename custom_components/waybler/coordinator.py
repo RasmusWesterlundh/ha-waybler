@@ -202,22 +202,20 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
         Persists the new token to the config entry and updates the in-memory
         ``_token`` used by subsequent REST and WebSocket calls.
 
-        Raises ``ConfigEntryAuthFailed`` if both refresh and login fail so that
-        HA can surface a re-auth notification to the user.
+        Raises ``ConfigEntryAuthFailed`` if the credentials are rejected so HA
+        can surface a re-auth notification to the user.
         """
         try:
-            new_token = await self._client.refresh_token(self._token)
-            _LOGGER.info("Waybler token refreshed successfully")
-        except WayblerAuthError:
-            _LOGGER.warning("Waybler token refresh failed — attempting fresh login")
-            try:
-                email = self._entry.data[CONF_EMAIL]
-                password = self._entry.data[CONF_PASSWORD]
-                new_token, _ = await self._client.login(email, password)
-                _LOGGER.info("Waybler re-login succeeded")
-            except WayblerApiError as login_err:
-                _LOGGER.error("Waybler re-login failed: %s", login_err)
-                raise ConfigEntryAuthFailed(f"Waybler authentication failed: {login_err}") from login_err
+            new_token = await self._client.async_get_token(
+                self._entry.data[CONF_EMAIL],
+                self._entry.data[CONF_PASSWORD],
+                self._token,
+            )
+        except WayblerAuthError as err:
+            _LOGGER.error("Waybler re-login failed: %s", err)
+            raise ConfigEntryAuthFailed(
+                f"Waybler authentication failed: {err}"
+            ) from err
 
         self._token = new_token
         self.hass.config_entries.async_update_entry(
@@ -300,6 +298,11 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
             await self.async_refresh_and_save_token()
         except ConfigEntryAuthFailed as err:
             _LOGGER.error("Waybler periodic re-auth/resync: auth failed: %s", err)
+            return
+        except WayblerApiError as err:
+            _LOGGER.warning(
+                "Waybler periodic re-auth/resync: transient error: %s", err
+            )
             return
 
         await self._async_restart_websocket_connection()
@@ -858,6 +861,21 @@ class WayblerCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     self._push_coordinator_update()
                 except WayblerApiError as err:
                     _LOGGER.error("Waybler: could not start manual-price session: %s", err)
+                return
+
+            # Zones with a fixed electricity price have no spot-price schedule to
+            # optimize. Start the session immediately so plugging in always charges.
+            if not self._is_variable_price_zone:
+                _LOGGER.info(
+                    "Waybler: fixed-price zone — starting session without a price limit"
+                )
+                try:
+                    await self.async_start_session()
+                    self._push_coordinator_update()
+                except WayblerApiError as err:
+                    _LOGGER.error(
+                        "Waybler: could not start fixed-price session: %s", err
+                    )
                 return
 
             strategy: str = opts.get(CONF_OPT_STRATEGY, DEFAULT_OPT_STRATEGY)

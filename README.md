@@ -4,6 +4,7 @@ A custom Home Assistant integration for [Waybler](https://waybler.com/) EV charg
 
 ## Features
 
+- **Automatic station discovery** — sign in and pick your charging station; no station IDs to copy by hand
 - **Real-time charging state** via WebSocket — no polling
 - **Price optimizer** — automatically starts charging at the cheapest hours using multiple strategies
 - Start/stop a charging session from HA
@@ -20,7 +21,7 @@ A custom Home Assistant integration for [Waybler](https://waybler.com/) EV charg
 | `switch.waybler_ev_charger_charging` | Switch | Start / stop charging (turn on triggers optimizer) |
 | `sensor.waybler_ev_charger_station_state` | Sensor | Station state (Busy / EvConnected / NoEv / Available) |
 | `sensor.waybler_ev_charger_session_energy` | Sensor | Energy delivered this session (kWh) |
-| `sensor.waybler_ev_charger_power` | Sensor | Live power (W) |
+| `sensor.waybler_ev_charger_session_power` | Sensor | Live power (W) |
 | `sensor.waybler_ev_charger_session_id` | Sensor | Active session ID |
 | `sensor.waybler_ev_charger_computed_price_limit` | Sensor | Price limit the optimizer last calculated (incl. VAT) |
 | `sensor.waybler_ev_charger_charge_time_today` | Sensor | Total charge time today (hours) |
@@ -41,30 +42,29 @@ Copy `custom_components/waybler/` into your HA `config/custom_components/` direc
 
 ## Configuration
 
-The config flow will prompt for:
+The config flow asks for your Waybler email and password. After logging in, the
+integration connects to the Waybler WebSocket and discovers every charging
+station available to your account. If the account has more than one station,
+you pick the one this home should use. No station, contract or zone IDs need to
+be entered manually.
 
-| Field | Where to find it |
-|-------|-----------------|
-| Email & password | Your Waybler account credentials |
-| Station ID | From the Waybler app — your parking spot's station ID |
-| Contract user ID | From the Waybler app — your contract user ID |
-| Zone ID | From the Waybler app — your zone ID |
-| Spot price sensor *(optional)* | Leave empty to use the price data built into the integration |
+The selected station is stored in the config entry. To change it later — for
+example after moving to a different parking spot — open **Settings → Devices &
+Services → Waybler → ⋮ → Reconfigure**. The integration rediscovers your
+stations and lets you pick another one.
 
-### Finding your IDs
+### Fixed-price zones
 
-Enable debug logging and look for the `ChargeZoneModel` message in the HA log — it lists all stations in your zone with their IDs.
+Some Waybler contracts use a fixed electricity price instead of spot pricing
+(`isVariablePriceZone: false`). In those zones there is no price schedule to
+optimize, so the integration starts charging immediately when the car is plugged
+in. The price optimizer strategies only apply to variable-price zones.
 
-```yaml
-# configuration.yaml
-logger:
-  logs:
-    custom_components.waybler: debug
-```
+### Price optimizer
 
-## Price Optimizer
-
-When the car connects, the optimizer automatically computes a price limit and starts a session. Configure it under **Settings → Integrations → Waybler → Configure**:
+For variable-price zones, when the car connects the optimizer computes a price
+limit and starts a session. Configure it under **Settings → Integrations →
+Waybler → Configure**:
 
 | Option | Description |
 |--------|-------------|
@@ -95,10 +95,23 @@ On startup the integration opens a persistent WebSocket connection to `wss://api
 
 Write operations (start/stop session, update price limit) use the Waybler REST API. The `spotPriceLimit` API field is excl. VAT — the integration converts all-in prices automatically using the zone's `consumptionVatRate`.
 
+If the token refresh endpoint is unavailable, the integration automatically logs
+in again with the stored credentials before reconnecting.
+
 ## Requirements
 
-- Home Assistant 2024.1+
+- Home Assistant 2024.6+
 - A Waybler account with an active contract
+
+## Troubleshooting
+
+- `sensor.waybler_ev_charger_station_state` should show `NoEv`,
+  `EvConnected`, `Busy` or `Available`. If it stays `unknown`, the WebSocket
+  could not read your zone. Use **Reconfigure** to rediscover the station; if
+  that fails, check the Home Assistant log for `custom_components.waybler`.
+- If the car is plugged in but charging does not start, check that both the
+  `Price optimization` and `Charging` switches are on and that
+  `opt_auto_start` is enabled in the integration options.
 
 ## License
 
