@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import logging
 
-import aiohttp
-
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import WayblerApiClient, WayblerAuthError, WayblerApiError
-from .const import CONF_TOKEN, DOMAIN, PLATFORMS
+from .api import WayblerApiClient, WayblerApiError, WayblerAuthError
+from .const import CONF_EMAIL, CONF_PASSWORD, CONF_TOKEN, DOMAIN, PLATFORMS
 from .coordinator import WayblerCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -20,42 +18,38 @@ _LOGGER = logging.getLogger(__name__)
 type WayblerConfigEntry = ConfigEntry[WayblerCoordinator]
 
 
+async def _async_reload_entry(
+    hass: HomeAssistant, entry: WayblerConfigEntry
+) -> None:
+    """Reload the integration when its options change."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: WayblerConfigEntry) -> bool:
     """Set up Waybler from a config entry."""
     session = async_get_clientsession(hass)
     client = WayblerApiClient(session)
 
-    token = entry.data.get(CONF_TOKEN, "")
+    email = entry.data.get(CONF_EMAIL, "")
+    password = entry.data.get(CONF_PASSWORD, "")
+    if not email or not password:
+        raise ConfigEntryAuthFailed("Waybler: no credentials available")
 
-    # Refresh the stored token on startup to detect credential issues early.
-    if token:
-        try:
-            token = await client.refresh_token(token)
-            hass.config_entries.async_update_entry(
-                entry, data={**entry.data, CONF_TOKEN: token}
-            )
-        except WayblerAuthError:
-            _LOGGER.warning("Waybler: stored token is invalid, will re-login")
-            token = ""
+    try:
+        token = await client.async_get_token(
+            email, password, entry.data.get(CONF_TOKEN, "")
+        )
+    except WayblerAuthError as err:
+        raise ConfigEntryAuthFailed(
+            f"Waybler: login failed — check credentials: {err}"
+        ) from err
+    except WayblerApiError as err:
+        raise ConfigEntryNotReady(f"Waybler: API unavailable: {err}") from err
 
-    if not token:
-        from .const import CONF_EMAIL, CONF_PASSWORD  # noqa: PLC0415
-
-        email = entry.data.get(CONF_EMAIL, "")
-        password = entry.data.get(CONF_PASSWORD, "")
-        if not email or not password:
-            raise ConfigEntryAuthFailed("Waybler: no credentials available")
-        try:
-            token, _ = await client.login(email, password)
-            hass.config_entries.async_update_entry(
-                entry, data={**entry.data, CONF_TOKEN: token}
-            )
-        except WayblerAuthError as err:
-            raise ConfigEntryAuthFailed(
-                f"Waybler: login failed — check credentials: {err}"
-            ) from err
-        except WayblerApiError as err:
-            raise ConfigEntryNotReady(f"Waybler: API unavailable: {err}") from err
+    if token != entry.data.get(CONF_TOKEN):
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_TOKEN: token}
+        )
 
     coordinator = WayblerCoordinator(hass, entry, client, token)
 
@@ -68,6 +62,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: WayblerConfigEntry) -> b
     _LOGGER.info("Waybler: WebSocket task scheduled, integration setup complete")
 
     entry.runtime_data = coordinator
+    entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True

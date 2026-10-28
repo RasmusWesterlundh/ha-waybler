@@ -18,8 +18,11 @@ from .const import (
     API_REFRESH_PATH,
     API_SESSION_PATH,
     API_SESSIONS_CHARGE_PATH,
+    DISCOVERY_TIMEOUT,
     JWT_USER_ID_CLAIM,
     REQUEST_TIMEOUT,
+    WS_APP_UUID,
+    WS_URL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -31,6 +34,10 @@ class WayblerApiError(Exception):
 
 class WayblerAuthError(WayblerApiError):
     """Raised when authentication fails."""
+
+
+class WayblerTermsNotAcceptedError(WayblerApiError):
+    """Raised when the Waybler account has not accepted the current terms."""
 
 
 class WayblerCarNotConnectedError(WayblerApiError):
@@ -62,6 +69,36 @@ class PriceEntry:
     currency: str         # e.g. "SEK"
 
 
+@dataclass(frozen=True)
+class WayblerStation:
+    """A charging station discovered from the Waybler zone model."""
+
+    zone_id: int
+    zone_name: str
+    contract_user_id: int
+    station_id: int
+    station_name: str
+    group_name: str
+    state: str
+
+    @property
+    def key(self) -> str:
+        """Stable key used in config-flow selections."""
+        return f"{self.zone_id}:{self.contract_user_id}:{self.station_id}"
+
+    @property
+    def label(self) -> str:
+        """Human-readable label for the station picker."""
+        parts = [
+            self.station_name or f"Station {self.station_id}",
+            self.group_name,
+            self.zone_name,
+        ]
+        # Preserve order while dropping blanks and duplicates.
+        unique = list(dict.fromkeys(part for part in parts if part))
+        return " · ".join(unique)
+
+
 @dataclass
 class CoordinatorData:
     """Data held by the coordinator, driven by WebSocket pushes."""
@@ -89,6 +126,39 @@ def _decode_jwt_user_id(token: str) -> int:
         raise WayblerApiError(f"Could not decode user ID from JWT: {err}") from err
 
 
+def _stations_from_zone(zone: dict[str, Any]) -> list[WayblerStation]:
+    """Flatten a ChargeZoneModel into selectable stations."""
+    try:
+        zone_id = int(zone["zoneId"])
+        contract_user_id = int(zone["contractUserId"])
+    except (KeyError, TypeError, ValueError):
+        return []
+
+    zone_name = str(zone.get("name") or "")
+    stations: list[WayblerStation] = []
+
+    for group in zone.get("stationGroups") or []:
+        group_name = str(group.get("name") or "")
+        for station in group.get("stations") or []:
+            try:
+                station_id = int(station["stationId"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            stations.append(
+                WayblerStation(
+                    zone_id=zone_id,
+                    zone_name=zone_name,
+                    contract_user_id=contract_user_id,
+                    station_id=station_id,
+                    station_name=str(station.get("name") or ""),
+                    group_name=group_name,
+                    state=str(station.get("state") or ""),
+                )
+            )
+
+    return stations
+
+
 class WayblerApiClient:
     """Async client for the Waybler v7 API."""
 
@@ -106,56 +176,40 @@ class WayblerApiClient:
     # ------------------------------------------------------------------
 
     async def login(self, email: str, password: str) -> tuple[str, int]:
-        """Log in via subprocess curl and return (token, user_id)."""
-        body = json.dumps({"email": email, "password": password})
+        """Log in and return (token, user_id)."""
         url = f"{API_BASE_URL}{API_LOGIN_PATH}"
-        cmd = [
-            "curl", "-s",
-            "-X", "POST",
-            url,
-            "-H", "Content-Type: application/json; charset=utf-8",
-            "--data-raw", body,
-        ]
-        _LOGGER.error(
-            "Waybler login REQUEST: url=%s | headers=[Content-Type: application/json; charset=utf-8] | body=%s",
-            url, body,
-        )
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        except Exception as err:
-            raise WayblerApiError(f"curl subprocess failed: {err}") from err
-
-        raw = stdout.decode().strip()
-        err_out = stderr.decode().strip()
-        _LOGGER.error(
-            "Waybler login RESPONSE: returncode=%s | stdout=%s | stderr=%s",
-            proc.returncode, raw, err_out,
-        )
-
-        if not raw:
-            raise WayblerApiError("curl returned empty response")
+            async with self._session.post(
+                url,
+                json={"email": email, "password": password},
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as resp:
+                status = resp.status
+                raw = await resp.text()
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise WayblerApiError(f"Login request failed: {err}") from err
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as err:
-            raise WayblerApiError(f"curl response not JSON: {raw!r}") from err
+            raise WayblerApiError(
+                f"Login returned a non-JSON response (HTTP {status})"
+            ) from err
 
-        _LOGGER.error("Waybler login PARSED JSON: %s", data)
+        if not isinstance(data, dict):
+            raise WayblerApiError("Login returned an unexpected response")
 
         if data.get("result") != "Ok":
             raise WayblerAuthError(
                 f"Login failed: result={data.get('result')}, "
-                f"email={data.get('email')}, password={data.get('password')}"
+                f"email={data.get('email')}"
             )
 
-        token = data["token"]
-        user_id = _decode_jwt_user_id(token)
-        return token, user_id
+        token = data.get("token")
+        if not token:
+            raise WayblerApiError("Login response did not contain a token")
+        return token, _decode_jwt_user_id(token)
 
     async def refresh_token(self, current_token: str) -> str:
         """Refresh a token and return the new one.
@@ -165,7 +219,78 @@ class WayblerApiClient:
         data = await self._get(API_REFRESH_PATH, token=current_token)
         if data.get("result") != "Ok":
             raise WayblerAuthError("Token refresh failed")
-        return data["token"]
+        token = data.get("token")
+        if not token:
+            raise WayblerApiError("Token refresh returned no token")
+        return token
+
+    async def async_get_token(
+        self, email: str, password: str, current_token: str = ""
+    ) -> str:
+        """Return a usable token, refreshing first and logging in as a fallback."""
+        if current_token:
+            try:
+                return await self.refresh_token(current_token)
+            except WayblerApiError as err:
+                _LOGGER.debug(
+                    "Waybler token refresh failed (%s); logging in again", err
+                )
+
+        token, _ = await self.login(email, password)
+        return token
+
+    # ------------------------------------------------------------------
+    # Discovery
+    # ------------------------------------------------------------------
+
+    async def discover_stations(
+        self, token: str, timeout: float = DISCOVERY_TIMEOUT
+    ) -> list[WayblerStation]:
+        """Read the account's zones and stations from the Waybler WebSocket."""
+        ws_url = f"{WS_URL}?jwt={token}&app-uuid={WS_APP_UUID}"
+        stations: list[WayblerStation] = []
+        terms_accepted = True
+
+        try:
+            async with asyncio.timeout(timeout):
+                async with self._session.ws_connect(
+                    ws_url,
+                    heartbeat=30,
+                    receive_timeout=timeout,
+                ) as ws:
+                    async for msg in ws:
+                        if msg.type is aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = json.loads(msg.data)
+                            except json.JSONDecodeError:
+                                continue
+                            model_type = data.get("modelType")
+                            if model_type == "ChargeZoneModel":
+                                stations.extend(_stations_from_zone(data))
+                            elif model_type == "UserTermsModel":
+                                terms_accepted = bool(
+                                    data.get("accepted", True)
+                                )
+                            elif model_type == "WebsocketInitMessage":
+                                break
+                        elif msg.type in (
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.ERROR,
+                        ):
+                            break
+        except TimeoutError as err:
+            raise WayblerApiError(
+                "Timed out while reading zones from Waybler"
+            ) from err
+        except aiohttp.ClientError as err:
+            raise WayblerApiError(f"Waybler WebSocket error: {err}") from err
+
+        if not terms_accepted:
+            raise WayblerTermsNotAcceptedError(
+                "The Waybler account has not accepted the current terms"
+            )
+        return stations
 
     # ------------------------------------------------------------------
     # Sessions
@@ -194,7 +319,9 @@ class WayblerApiClient:
         if data.get("result") != "Ok":
             contract_user_state = data.get("contractUserId", "")
             if contract_user_state == "TermsNotAccepted":
-                raise WayblerApiError("Terms not accepted for this contract user")
+                raise WayblerTermsNotAcceptedError(
+                    "Terms not accepted for this contract user"
+                )
             raise WayblerCarNotConnectedError(
                 f"Start session failed: result={data.get('result')}, "
                 f"contractUserId={contract_user_state}"
@@ -227,7 +354,7 @@ class WayblerApiClient:
             raise WayblerApiError(f"Update price limit failed: {data}")
 
     # ------------------------------------------------------------------
-    # HTTP helpers — all requests via curl subprocess
+    # HTTP helpers
     # ------------------------------------------------------------------
 
     async def _request(
@@ -238,38 +365,43 @@ class WayblerApiClient:
         token: str | None = None,
     ) -> dict[str, Any]:
         url = f"{API_BASE_URL}{path}"
-        cmd = ["curl", "-s", "-X", method, url,
-               "-H", "Content-Type: application/json; charset=utf-8"]
+        headers = {"Content-Type": "application/json; charset=utf-8"}
         if token:
-            cmd += ["-H", f"Authorization: Bearer {token}"]
-        if payload is not None:
-            cmd += ["--data-raw", json.dumps(payload)]
+            headers["Authorization"] = f"Bearer {token}"
 
         _LOGGER.debug("Waybler %s %s", method, path)
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            async with self._session.request(
+                method,
+                url,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as resp:
+                status = resp.status
+                raw = await resp.text()
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise WayblerApiError(f"{method} {path} failed: {err}") from err
+
+        _LOGGER.debug("Waybler %s %s → HTTP %s", method, path, status)
+
+        if status in (401, 403):
+            raise WayblerAuthError(f"Unauthorized on {method} {path}")
+        if status >= 500:
+            raise WayblerApiError(f"{method} {path} returned HTTP {status}")
+        if not raw:
+            raise WayblerApiError(
+                f"Empty response on {method} {path} (HTTP {status})"
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=REQUEST_TIMEOUT)
-        except Exception as err:
-            raise WayblerApiError(f"curl failed on {method} {path}: {err}") from err
-
-        raw = stdout.decode().strip()
-        _LOGGER.debug("Waybler %s %s → rc=%s body=%s", method, path, proc.returncode, raw)
-
-        if proc.returncode != 0 or not raw:
-            raise WayblerApiError(f"curl error on {method} {path}: rc={proc.returncode} stderr={stderr.decode().strip()}")
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as err:
-            raise WayblerApiError(f"Non-JSON response on {method} {path}: {raw!r}") from err
+            raise WayblerApiError(
+                f"Non-JSON response on {method} {path} (HTTP {status})"
+            ) from err
 
-        # Map HTTP-like error signals in the response
-        # curl -s doesn't give us the HTTP status code unless we ask
-        # Re-run with -w to get status if needed — for now detect auth errors by result field
+        # Some Waybler endpoints return a 200 with an error result.
         if isinstance(data, dict) and data.get("result") == "Unauthorized":
             raise WayblerAuthError(f"Unauthorized on {method} {path}")
 
@@ -283,7 +415,6 @@ class WayblerApiClient:
         path: str,
         payload: dict,
         token: str | None = None,
-        authenticated: bool = True,
     ) -> dict[str, Any]:
         return await self._request("POST", path, payload=payload, token=token)
 
@@ -292,5 +423,3 @@ class WayblerApiClient:
 
     async def _delete(self, path: str, token: str) -> dict[str, Any]:
         return await self._request("DELETE", path, token=token)
-
-
